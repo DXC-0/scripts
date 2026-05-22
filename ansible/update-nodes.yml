@@ -1,0 +1,121 @@
+- name: Update Server and Configure DNS
+  hosts: all
+  become: true
+
+  vars:
+    possible_services:
+      - tor
+      - tor@default
+    ansible_become_pass: "{{ sudo_passwords[inventory_hostname] }}"
+    dns_server: "9.9.9.9"
+
+  vars_files:
+    - sudo_passwords.yml
+
+  tasks:
+    - name: Stop and disable systemd-resolved
+      ansible.builtin.systemd:
+        name: systemd-resolved
+        state: stopped
+        enabled: false
+        daemon_reload: true
+      ignore_errors: true
+
+    - name: Configure static DNS in resolved.conf
+      ansible.builtin.copy:
+        dest: /etc/systemd/resolved.conf
+        content: |
+          [Resolve]
+          DNS={{ dns_server }}
+          FallbackDNS=
+          Domains=~.
+
+    - name: Ensure /etc/resolv.conf is properly linked
+      ansible.builtin.file:
+        src: /run/systemd/resolve/stub-resolv.conf
+        dest: /etc/resolv.conf
+        state: link
+        force: true
+
+    - name: Install DNS utilities (Debian/Ubuntu)
+      apt:
+        name: dnsutils
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+      ignore_errors: true
+
+    - name: Install DNS utilities (Arch Linux)
+      pacman:
+        name: bind
+        state: present
+      when: ansible_distribution == "Archlinux"
+      ignore_errors: true
+
+    - name: Ubuntu Update
+      apt:
+        update_cache: yes
+        upgrade: dist
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+      register: apt_result
+      retries: 3
+      delay: 10
+      until: apt_result is success
+      ignore_errors: true
+
+    - name: Archlinux Update
+      pacman:
+        update_cache: yes
+        upgrade: yes
+      when: ansible_distribution == "Archlinux"
+      register: pacman_result
+      retries: 3
+      delay: 10
+      until: pacman_result is success
+      ignore_errors: true
+
+    - name: Report APT/Pacman failure
+      debug:
+        msg: "WARNING: Package update failed on {{ inventory_hostname }}. Manual intervention may be required."
+      when: 
+        - (ansible_os_family == "Debian" and apt_result.failed | default(false)) or
+          (ansible_distribution == "Archlinux" and pacman_result.failed | default(false))
+
+    - name: Server Reboot (if needed)
+      reboot:
+        reboot_timeout: 600
+        test_command: whoami
+      when: ansible_check_mode == false
+
+    - name: Service Detection
+      shell: |
+        for svc in {{ possible_services | join(' ') }}; do
+          systemctl is-active --quiet "$$svc" && echo "$$svc" && exit 0
+        done
+        exit 1
+      register: detected_service
+      failed_when: false
+      changed_when: false
+
+    - name: Service Display
+      debug:
+        msg: "Detected Service : {{ detected_service.stdout | default('None') }}"
+
+    - name: Service Activation
+      systemd:
+        name: "{{ detected_service.stdout }}"
+        state: started
+        enabled: true
+      when: detected_service.stdout != ""
+
+    - name: Verify DNS resolution
+      command: dig +short @9.9.9.9 google.com
+      register: dns_test
+      changed_when: false
+      failed_when: false
+      ignore_errors: true
+
+    - name: Report DNS test result
+      debug:
+        msg: "DNS test {{ 'PASSED' if dns_test.rc == 0 else 'FAILED (dig not available or DNS issue)' }}"
